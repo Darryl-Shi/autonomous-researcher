@@ -2,3 +2,5 @@ google-genai
 modal
 python-dotenv
 rich
+fastapi
+uvicorn[standard]
