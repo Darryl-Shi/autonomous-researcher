@@ -1,9 +1,10 @@
 import os
-import subprocess
 import sys
-from typing import Optional
+from typing import Optional, List
+
 from google import genai
 from google.genai import types
+
 from logger import print_panel, print_status, log_step, logger
 
 import modal
@@ -12,6 +13,42 @@ import modal
 _shared_sandbox: Optional[modal.Sandbox] = None
 _shared_gpu: Optional[str] = None  # Track which GPU the sandbox was created with
 _selected_gpu: Optional[str] = None  # User-selected GPU for this run
+
+
+def _build_generation_config(
+    *,
+    tools: Optional[list] = None,
+    system_instruction: Optional[str] = None,
+    disable_autofc: bool = False,
+) -> types.GenerateContentConfig:
+    """
+    Build a GenerateContentConfig that:
+
+    - Enables Gemini "thinking mode" with visible thought summaries.
+    - Sets thinking_level=HIGH (recommended for Gemini 3 Pro).
+    - Optionally disables automatic function calling so we can control
+      when tools run and show thoughts before actions.
+    """
+    thinking_config = types.ThinkingConfig(
+        thinking_level=types.ThinkingLevel.HIGH,
+        include_thoughts=True,
+    )
+
+    config_kwargs = {
+        "tools": tools,
+        "system_instruction": system_instruction,
+        "thinking_config": thinking_config,
+    }
+
+    if disable_autofc:
+        # Turn off automatic Python function calling so we get function_call
+        # parts back and can execute tools manually in our loop.
+        config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+            disable=True
+        )
+
+    return types.GenerateContentConfig(**config_kwargs)
+
 
 def _get_shared_sandbox(gpu: Optional[str]) -> modal.Sandbox:
     """Create (once) and return a persistent sandbox for this run."""
@@ -67,6 +104,10 @@ def _close_shared_sandbox():
 def execute_in_sandbox(code: str):
     """
     Executes Python code inside a persistent Modal Sandbox using sandbox.exec.
+
+    This function is exposed to Gemini as a tool. The agent will decide when to
+    call it, and we run it manually in the loop so that we can show the
+    model's thoughts before the code executes.
     """
     try:
         sandbox = _get_shared_sandbox(_selected_gpu)
@@ -81,8 +122,8 @@ def execute_in_sandbox(code: str):
         proc.stdin.write_eof()
         proc.stdin.drain()  # Flush buffered stdin
 
-        stdout = []
-        stderr = []
+        stdout: List[str] = []
+        stderr: List[str] = []
 
         log_step("EXECUTION", "Reading stdout/stderr streams...")
         for part in proc.stdout:
@@ -106,143 +147,201 @@ def execute_in_sandbox(code: str):
         log_step("ERROR", f"Sandbox Execution Failed: {str(e)}")
         return f"Sandbox Execution Failed: {str(e)}"
 
-def run_experiment_loop(hypothesis):
-    """The main loop using native tool calling."""
-    print_panel(f"Hypothesis: {hypothesis}", "Starting Experiment", "bold green")
-    log_step("START", f"Hypothesis: {hypothesis}")
-    print_status(f"Sandbox GPU request: {_selected_gpu or 'CPU'}", "info")
 
-    client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
-    
-    # Define the tool
-    tools = [execute_in_sandbox]
+def _build_system_prompt(gpu_hint: str) -> str:
+    """System-level instructions for the Gemini agent."""
+    return f"""You are an autonomous research scientist.
+Your job is to rigorously verify the user's hypothesis using experiments
+run in a Python sandbox.
 
-    gpu_hint = _selected_gpu or "CPU"
+Tool:
+- `execute_in_sandbox(code: str)`: Runs a Python script in a persistent Modal Sandbox.
+  - Preinstalled: numpy, pandas, torch, scikit-learn, matplotlib.
+  - Compute: Sandbox GPU request for this run: {gpu_hint}.
+  - The code runs as a normal Python script; no need to import `modal`.
 
-    system_prompt = f"""You are an autonomous research scientist.
-Your goal is to verify the user's hypothesis.
-
-**Your Tool**:
-- `execute_in_sandbox(code)`: Runs a Python script in a secure Modal Sandbox.
-- **Dependencies**: The environment has `numpy`, `pandas`, `torch`, `sklearn`, `matplotlib`.
-- **Compute**: Sandbox GPU request for this run: {gpu_hint}.
-- **Usage**: Just write the Python code. No need for `@app.local_entrypoint` or `modal` imports unless you are doing something advanced. The code runs as a standard script.
-
-**The Loop**:
-1. **Think**: Plan your next step.
-2. **Act**: Call `execute_in_sandbox` with your script.
-3. **Observe**: I will give you the results.
-
-Output [DONE] when you have verified the hypothesis.
+Working loop:
+1. **Think before acting.** Plan your next step in natural language.
+   We will show these thoughts in the CLI, so keep them understandable.
+2. **Act with tools.** When you need computation, call `execute_in_sandbox`
+   with a complete, self-contained script.
+3. **Observe and update.** Interpret tool results and decide what to do next.
+4. **Finish clearly.** When you have confidently verified or falsified
+   the hypothesis, write a short natural-language conclusion and then a
+   final line that contains only `[DONE]`.
 """
 
-    history = [
+
+def run_experiment_loop(hypothesis: str):
+    """Main agent loop using Gemini 3 Pro with thinking + manual tool calling."""
+    gpu_hint = _selected_gpu or "CPU"
+
+    print_panel(f"Hypothesis: {hypothesis}", "Starting Experiment", "bold green")
+    log_step("START", f"Hypothesis: {hypothesis}")
+    print_status(f"Sandbox GPU request: {gpu_hint}", "info")
+    print_status("Gemini thinking: HIGH (thought summaries visible)", "info")
+
+    client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+
+    # Expose the sandbox executor as a tool.
+    tools = [execute_in_sandbox]
+    system_prompt = _build_system_prompt(gpu_hint)
+
+    # Initial conversation: just the hypothesis as a user message.
+    history: List[types.Content] = [
         types.Content(
             role="user",
-            parts=[
-                types.Part.from_text(text=system_prompt),
-                types.Part.from_text(text=f"Hypothesis: {hypothesis}")
-            ]
+            parts=[types.Part.from_text(text=f"Hypothesis: {hypothesis}")],
         )
     ]
 
-    step_count = 0
     max_steps = 10
 
-    while step_count < max_steps:
-        step_count += 1
-        print_status(f"Step {step_count}...", "dim")
+    for step in range(1, max_steps + 1):
+        print_status(f"Step {step}...", "dim")
 
         try:
-            # Generate content with tools
             response = client.models.generate_content(
                 model="gemini-3-pro-preview",
                 contents=history,
-                config=types.GenerateContentConfig(
+                config=_build_generation_config(
                     tools=tools,
-                    # thinking_level="HIGH", # Enable deep thinking - Commented out due to validation error
-                )
+                    system_instruction=system_prompt,
+                    disable_autofc=True,  # manual tool loop
+                ),
             )
         except Exception as e:
             print_status(f"API Error: {e}", "error")
             logger.error(f"API Error: {e}")
             break
 
-        # Handle the response parts
-        # Gemini 3 Pro might output thoughts, text, and function calls.
-        
-        # 1. Log Thoughts (if available in text)
-        if response.text:
-            print_panel(response.text, "Agent Thought", "thought")
-            log_step("THOUGHT", response.text)
-            # Add model turn to history
-            history.append(types.Content(role="model", parts=[types.Part.from_text(text=response.text)]))
+        if not response.candidates:
+            print_status("Empty response from model.", "warning")
+            break
 
-            if "[DONE]" in response.text:
-                print_status("Agent signaled completion.", "success")
-                break
+        candidate = response.candidates[0]
+        model_content = candidate.content
 
-        # 2. Handle Function Calls
-        # We need to check all candidates/parts for function calls
-        function_called = False
-        for part in response.candidates[0].content.parts:
+        if not model_content or not model_content.parts:
+            print_status("Empty content from model.", "warning")
+            break
+
+        # IMPORTANT: append the full model message (including thought signatures
+        # and function call parts) so the SDK can preserve reasoning state.
+        history.append(model_content)
+
+        thoughts: List[str] = []
+        messages: List[str] = []
+        function_calls = []
+
+        for part in model_content.parts:
+            # Thought summaries from thinking mode.
+            if getattr(part, "thought", False) and part.text:
+                thoughts.append(part.text)
+
+            # Function/tool call parts.
             if part.function_call:
-                function_called = True
-                fn_name = part.function_call.name
-                fn_args = part.function_call.args
-                
-                print_panel(f"Calling {fn_name}...", "Tool Call", "code")
-                
-                if fn_name == "execute_in_sandbox":
-                    # Execute
-                    result = execute_in_sandbox(**fn_args)
-                    
-                    # Truncate result
-                    if len(result) > 20000:
-                        result = result[:10000] + "\n...[TRUNCATED]...\n" + result[-10000:]
+                function_calls.append(part.function_call)
 
-                    print_panel(result, "Tool Result", "result")
-                    log_step("TOOL_RESULT", "Executed")
+            # Regular assistant text (exclude thought parts so we don't double-print).
+            if part.text and not getattr(part, "thought", False):
+                messages.append(part.text)
 
-                    # Add function call and response to history
-                    # Note: We already added the text part above. Now we add the function call part if it wasn't in the text?
-                    # Actually, for Gemini, we should construct the Model turn with ALL parts (text + function_call)
-                    # and then the User turn with the function_response.
-                    
-                    # Let's reconstruct the correct history flow:
-                    # The 'response' object already has the model's turn content.
-                    # We just need to append the *response* content to history properly.
-                    
-                    # Remove the text-only append we did above to avoid duplication if we do it here
-                    if history[-1].role == "model":
-                        history.pop() 
-                    
-                    history.append(response.candidates[0].content)
-                    
-                    # Create the function response part
-                    history.append(types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_function_response(
-                                name=fn_name,
-                                response={"result": result}
-                            )
-                        ]
-                    ))
-        
-        if not function_called and not response.text:
-             print_status("Empty response from model.", "warning")
+        # 1. Show reasoning before any action.
+        if thoughts:
+            joined_thoughts = "\n\n".join(thoughts)
+            print_panel(joined_thoughts, "Agent Thinking", "thought")
+            log_step("THOUGHT", joined_thoughts)
 
+        # 2. Show natural-language messages (plans, explanations, etc.).
+        if messages:
+            joined_messages = "\n\n".join(messages)
+            print_panel(joined_messages, "Agent Message", "info")
+            log_step("MODEL", joined_messages)
+
+        combined_text = "\n".join(thoughts + messages)
+        if "[DONE]" in combined_text:
+            print_status("Agent signaled completion.", "success")
+            break
+
+        # If the model didn't call any tools this turn, assume we're done.
+        if not function_calls:
+            print_status(
+                "No tool calls in this step; assuming experiment is complete.", "info"
+            )
+            break
+
+        # 3. Execute requested tools (currently just execute_in_sandbox).
+        for fn_call in function_calls:
+            fn_name = fn_call.name
+            fn_args = dict(fn_call.args or {})
+
+            print_panel(f"{fn_name}({fn_args})", "Tool Call", "code")
+            log_step("TOOL_CALL", f"{fn_name}({fn_args})")
+
+            if fn_name == "execute_in_sandbox":
+                result = execute_in_sandbox(**fn_args)
+            else:
+                result = (
+                    f"Unsupported tool '{fn_name}'. "
+                    "Only 'execute_in_sandbox' is available."
+                )
+
+            # Truncate long outputs to keep console readable.
+            if isinstance(result, str) and len(result) > 20000:
+                result = (
+                    result[:10000]
+                    + "\n...[TRUNCATED]...\n"
+                    + result[-10000:]
+                )
+
+            print_panel(result, "Tool Result", "result")
+            log_step("TOOL_RESULT", "Executed")
+
+            # Feed the tool response back as a TOOL message with a functionResponse part.
+            history.append(
+                types.Content(
+                    role="tool",
+                    parts=[
+                        types.Part.from_function_response(
+                            name=fn_name,
+                            response={"result": result},
+                        )
+                    ],
+                )
+            )
+
+    # Final report generation.
     try:
-        # Final Report
         print_status("Generating Final Report...", "bold green")
-        history.append(types.Content(role="user", parts=[types.Part.from_text(text="Generate a concise InfoDense report.")]))
-        
-        final_report = client.models.generate_content(
+        history.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=(
+                            "Generate a concise, information-dense report that explains "
+                            "how you tested the hypothesis, what you observed, and your "
+                            "final conclusion."
+                        )
+                    )
+                ],
+            )
+        )
+
+        final_response = client.models.generate_content(
             model="gemini-3-pro-preview",
             contents=history,
-            # config=types.GenerateContentConfig(thinking_level="HIGH")
+            # Still use thinking so the model can reason about its own trace,
+            # but tools are not needed here.
+            config=_build_generation_config(
+                tools=None,
+                system_instruction=system_prompt,
+                disable_autofc=True,
+            ),
         )
-        print_panel(final_report.text, "Final Report", "bold green")
+
+        final_text = final_response.text or ""
+        print_panel(final_text, "Final Report", "bold green")
     finally:
         _close_shared_sandbox()
