@@ -76,8 +76,8 @@ export function LabNotebook() {
         <div className="flex-1 overflow-y-auto custom-scrollbar">
             <div className="max-w-5xl mx-auto py-24 px-8 space-y-32">
                 
-                {/* Initial Input State (Only visible when timeline is empty) */}
-                {orchestrator.timeline.length === 0 && (
+                {/* Initial Input State (Only visible when timeline is empty and not running) */}
+                {orchestrator.timeline.length === 0 && !isRunning && (
                     <div className="min-h-[60vh] flex flex-col justify-center items-center space-y-12 animate-in fade-in duration-1000">
                         <div className="space-y-6 text-center max-w-lg">
                             <h1 className="text-4xl md:text-5xl font-light tracking-tight text-white">
@@ -138,6 +138,27 @@ export function LabNotebook() {
                                     <span>Start Research</span>
                                 </button>
                             </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Loading State (Visible when running but no timeline events yet) */}
+                {orchestrator.timeline.length === 0 && isRunning && (
+                    <div className="min-h-[60vh] flex flex-col justify-center items-center space-y-8 animate-in fade-in duration-700">
+                        <div className="relative">
+                            <div className="absolute inset-0 bg-white/20 blur-xl rounded-full animate-pulse"></div>
+                            <div className="relative w-16 h-16 border-t-2 border-white rounded-full animate-spin"></div>
+                            <div className="absolute inset-0 flex items-center justify-center">
+                                <div className="w-2 h-2 bg-white rounded-full animate-ping" />
+                            </div>
+                        </div>
+                        <div className="space-y-2 text-center">
+                            <h2 className="text-xl font-light text-white tracking-wide animate-pulse">
+                                Initializing Research Environment
+                            </h2>
+                            <p className="text-sm text-[#86868b] font-mono">
+                                Spinning up main agent...
+                            </p>
                         </div>
                     </div>
                 )}
