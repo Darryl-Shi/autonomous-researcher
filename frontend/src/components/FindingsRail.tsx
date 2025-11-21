@@ -14,7 +14,8 @@ interface FindingsRailProps {
 
 function MiniChart({ chart }: { chart: ChartSpec }) {
     const width = 260;
-    const height = 120;
+    const height = 140; // slightly taller to fit axis labels
+    const padding = { top: 14, right: 10, bottom: 28, left: 46 };
 
     const series = chart.series?.[0];
     if (!series || !Array.isArray(series.values) || series.values.length === 0) return null;
@@ -26,11 +27,52 @@ function MiniChart({ chart }: { chart: ChartSpec }) {
     const max = Math.max(...values);
     const span = max - min || 1;
 
+    const innerWidth = width - padding.left - padding.right;
+    const innerHeight = height - padding.top - padding.bottom;
+
+    const formatNumber = (val: number) => {
+        const abs = Math.abs(val);
+        if (abs >= 1_000_000_000) return `${(val / 1_000_000_000).toFixed(1)}b`;
+        if (abs >= 1_000_000) return `${(val / 1_000_000).toFixed(1)}m`;
+        if (abs >= 1_000) return `${(val / 1_000).toFixed(1)}k`;
+        if (abs >= 100) return val.toFixed(0);
+        if (abs >= 1) return val.toFixed(2);
+        return val.toPrecision(2);
+    };
+
     const pts = values.map((v, idx) => {
-        const x = (idx / Math.max(values.length - 1, 1)) * (width - 20) + 10;
-        const y = height - 10 - ((v - min) / span) * (height - 30);
+        const x = padding.left + (idx / Math.max(values.length - 1, 1)) * innerWidth;
+        const y = padding.top + (1 - (v - min) / span) * innerHeight;
         return `${x},${y}`;
     });
+
+    // Respect labels if they match the series length; otherwise fall back to indices.
+    const xLabels =
+        Array.isArray(chart.labels) && chart.labels.length === values.length
+            ? chart.labels
+            : values.map((_, idx) => `${idx + 1}`);
+
+    const xTicks = (() => {
+        const maxTicks = 4; // keep tiny chart readable
+        const step = Math.max(1, Math.ceil(xLabels.length / maxTicks));
+        const ticks: { idx: number; label: string; x: number }[] = [];
+        for (let i = 0; i < xLabels.length; i += step) {
+            const x = padding.left + (i / Math.max(xLabels.length - 1, 1)) * innerWidth;
+            ticks.push({ idx: i, label: xLabels[i], x });
+        }
+        // Always include the last label for clarity
+        if (ticks[ticks.length - 1]?.idx !== xLabels.length - 1) {
+            const i = xLabels.length - 1;
+            const x = padding.left + (i / Math.max(xLabels.length - 1, 1)) * innerWidth;
+            ticks.push({ idx: i, label: xLabels[i], x });
+        }
+        return ticks;
+    })();
+
+    const yTicks = [0, 0.5, 1].map((t) => ({
+        value: min + span * t,
+        y: padding.top + (1 - t) * innerHeight,
+    }));
 
     const bars = chart.type === "bar";
 
@@ -40,7 +82,7 @@ function MiniChart({ chart }: { chart: ChartSpec }) {
                 <span>{chart.title || "Signal"}</span>
                 <span className="text-[9px] text-[#7c7c83]">{series.name || "metric"}</span>
             </div>
-            <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-[120px] text-white/80">
+            <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-[140px] text-white/80">
                 <defs>
                     <linearGradient id="spark" x1="0" x2="0" y1="0" y2="1">
                         <stop offset="0%" stopColor="rgba(255,255,255,0.08)" />
@@ -48,17 +90,40 @@ function MiniChart({ chart }: { chart: ChartSpec }) {
                     </linearGradient>
                 </defs>
                 <rect x="0" y="0" width={width} height={height} fill="url(#spark)" rx="10" />
-                <g stroke="rgba(255,255,255,0.1)" strokeWidth="1">
-                    {[0.25, 0.5, 0.75].map((t) => (
-                        <line key={t} x1="10" x2={width - 10} y1={10 + t * (height - 20)} y2={10 + t * (height - 20)} />
+
+                {/* Grid + axes */}
+                <g stroke="rgba(255,255,255,0.15)" strokeWidth="1">
+                    {yTicks.map(({ y }, i) => (
+                        <line key={`grid-${i}`} x1={padding.left} x2={width - padding.right} y1={y} y2={y} />
+                    ))}
+                    <line x1={padding.left} x2={padding.left} y1={padding.top} y2={height - padding.bottom} />
+                    <line x1={padding.left} x2={width - padding.right} y1={height - padding.bottom} y2={height - padding.bottom} />
+                </g>
+
+                {/* Y-axis labels */}
+                <g fill="rgba(255,255,255,0.65)" fontSize="9" textAnchor="end">
+                    {yTicks.map(({ y, value }, i) => (
+                        <text key={`ylabel-${i}`} x={padding.left - 6} y={y + 3}>
+                            {formatNumber(value)}
+                        </text>
                     ))}
                 </g>
+
+                {/* X-axis labels */}
+                <g fill="rgba(255,255,255,0.65)" fontSize="9" textAnchor="middle">
+                    {xTicks.map(({ x, label }, i) => (
+                        <text key={`xlabel-${i}`} x={x} y={height - 8}>
+                            {label}
+                        </text>
+                    ))}
+                </g>
+
                 {bars ? (
                     values.map((v, idx) => {
-                        const barWidth = (width - 20) / Math.max(values.length * 1.5, 1);
-                        const x = 10 + idx * ((width - 20) / Math.max(values.length, 1));
-                        const y = height - 10 - ((v - min) / span) * (height - 30);
-                        const h = height - 10 - y;
+                        const barWidth = innerWidth / Math.max(values.length * 1.4, 1);
+                        const x = padding.left + idx * (innerWidth / Math.max(values.length - 1, 1));
+                        const y = padding.top + (1 - (v - min) / span) * innerHeight;
+                        const h = height - padding.bottom - y;
                         return (
                             <rect
                                 key={idx}

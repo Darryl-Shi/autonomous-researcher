@@ -182,6 +182,7 @@ export function LabNotebook() {
                                         Orchestrator
                                     </span>
                                     <StreamingMarkdown
+                                        animateKey={key}
                                         content={item.content}
                                         markdownClassName="prose prose-invert prose-lg md:prose-xl max-w-none prose-p:text-[#d1d1d6] prose-p:font-light prose-p:leading-relaxed prose-strong:text-white prose-headings:text-white prose-code:text-[#d1d1d6] prose-pre:bg-[#1d1d1f] prose-pre:border prose-pre:border-[#333]"
                                     />

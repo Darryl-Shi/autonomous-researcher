@@ -7,7 +7,7 @@ interface NotebookCellProps {
 }
 
 export function NotebookCell({ step }: NotebookCellProps) {
-    const { type, content } = step;
+    const { type, content, id } = step;
 
     if (type === "thought") {
         return (
@@ -18,6 +18,7 @@ export function NotebookCell({ step }: NotebookCellProps) {
                 </div>
                 <div className="pl-3 border-l border-[#1d1d1f] ml-0.5">
                     <StreamingMarkdown
+                        animateKey={id}
                         content={content}
                         markdownClassName="prose prose-invert prose-sm max-w-none prose-p:text-[#86868b] prose-p:text-xs prose-p:leading-relaxed prose-p:font-light prose-headings:text-[#d1d1d6] prose-strong:text-[#d1d1d6] prose-code:text-[#d1d1d6] prose-pre:bg-[#1d1d1f] prose-pre:border prose-pre:border-[#333] [&>*:first-child]:mt-0"
                     />
